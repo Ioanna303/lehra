@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lehra — Sargam Composer</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>Lehra <span class="sub">sargam composer &amp; looper</span></h1>
+  </header>
+
+  <section class="controls">
+    <div class="control">
+      <label for="saSelect">Sa (tonic)</label>
+      <select id="saSelect"></select>
+    </div>
+    <div class="control">
+      <label for="instrumentSelect">Instrument</label>
+      <select id="instrumentSelect"></select>
+    </div>
+    <div class="control">
+      <label for="tempo">Tempo (BPM)</label>
+      <input type="number" id="tempo" min="20" max="300" value="80">
+    </div>
+    <div class="control">
+      <label for="loopToggle">Loop</label>
+      <input type="checkbox" id="loopToggle" checked>
+    </div>
+    <div class="control">
+      <label for="droneVolume">Drone Volume</label>
+      <input type="range" id="droneVolume" min="0" max="1" step="0.01" value="0.6">
+    </div>
+    <div class="control buttons">
+      <button id="playBtn">▶ Play</button>
+      <button id="stopBtn" disabled>■ Stop</button>
+      <button id="droneBtn">🎻 Tanpura Drone</button>
+    </div>
+  </section>
+
+  <section class="controls">
+    <div class="control">
+      <label for="savedSelect">Saved Lehras</label>
+      <select id="savedSelect"><option value="">— none —</option></select>
+    </div>
+    <div class="control buttons">
+      <button id="saveLehraBtn">💾 Save Lehra</button>
+      <button id="deleteLehraBtn" disabled>🗑 Delete</button>
+    </div>
+  </section>
+
+  <section class="editor">
+    <label for="sargamInput">Sargam</label>
+    <textarea id="sargamInput" spellcheck="false" rows="4">S R G M | P M G R | S R G M | P - - - |</textarea>
+    <div id="statusLine" class="status"></div>
+  </section>
+
+  <section class="legend">
+    <strong>Syntax:</strong>
+    <span><code>S R G M P D N</code> shuddha swaras</span>
+    <span><code>r g d n</code> komal (flat), <code>m</code> shuddha Ma, <code>M</code> tivra (sharp) Ma</span>
+    <span><code>,S</code> mandra (lower) octave · <code>S</code> madhya (middle) · <code>S'</code> taar (upper)</span>
+    <span><code>-</code> extend previous note one beat</span>
+    <span><code>.</code> rest one beat</span>
+    <span><code>|</code> bar line (visual only)</span>
+  </section>
+
+  <section class="display">
+    <div id="noteDisplay" class="note-display"></div>
+  </section>
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>
