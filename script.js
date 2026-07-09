@@ -670,22 +670,70 @@ function deleteLehra() {
 }
 
 // ---------- Tanpura drone ----------
-// Traditional 4-string tanpura cycle: Pa, Sa, Sa, Sa (mandra) — always tuned
-// to whatever Sa is currently selected, so it follows the lehra's tonic.
-const DRONE_PATTERN = [
-  { ratio: 3 / 2, octave: "mandra" }, // Pa, a fourth below the next tone (Sa)
-  { ratio: 1, octave: "madhya" },     // Sa
-  { ratio: 1, octave: "madhya" },     // Sa
-  { ratio: 1, octave: "mandra" },     // Sa (lower) — held a full beat
-];
-const DRONE_BPM = 90;
-const DRONE_INTERVAL_S = 60 / DRONE_BPM;
-const DRONE_ATTACK_S = 0.28; // slow-ish swell, pluck transient softened but still present
+// A single sustained drone recording per pitch class (samples/drone/<name>.m4a),
+// tuned to whatever Sa is currently selected and looped back-to-back with a
+// razor-thin crossfade at the splice point so the loop has no click.
+const DRONE_LOOP_OVERLAP_S = 0.0002;
+
+// saSelect option labels use sharps; drone filenames use flats (matches NOTE_NAMES).
+const SHARP_TO_DRONE_NAME = {
+  "C": "C", "C#": "Db", "D": "D", "D#": "Eb", "E": "E", "F": "F",
+  "F#": "Gb", "G": "G", "G#": "Ab", "A": "A", "A#": "Bb", "B": "B",
+};
+
+// Drone recordings have several seconds of near-silence at the head/tail
+// (room tone before/after the note rings). Looping the raw file length would
+// splice in that silence as an audible gap, so we scan each buffer once for
+// where the actual tone starts/ends and only loop that trimmed span.
+const DRONE_SILENCE_THRESHOLD_DB = -50;
+
+function findLoopBounds(buffer) {
+  const threshold = Math.pow(10, DRONE_SILENCE_THRESHOLD_DB / 20);
+  const channels = [];
+  for (let c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c));
+  const length = buffer.length;
+  const isLoudAt = (i) => channels.some((data) => Math.abs(data[i]) > threshold);
+
+  let start = 0;
+  while (start < length && !isLoudAt(start)) start++;
+
+  let end = length - 1;
+  while (end > start && !isLoudAt(end)) end--;
+
+  if (start >= end) return { start: 0, end: buffer.duration }; // no signal detected — fall back to full buffer
+
+  return { start: start / buffer.sampleRate, end: (end + 1) / buffer.sampleRate };
+}
+
+const droneSampleCache = new Map(); // name -> { buffer, bounds }
+
+async function loadDroneSample(name) {
+  if (droneSampleCache.has(name)) return droneSampleCache.get(name);
+  const ctx = ensureAudioCtx();
+  try {
+    const res = await fetch(`samples/drone/${name}.m4a`);
+    if (!res.ok) throw new Error("not found");
+    const buffer = await ctx.decodeAudioData(await res.arrayBuffer());
+    normalizeBuffer(buffer);
+    const entry = { buffer, bounds: findLoopBounds(buffer) };
+    droneSampleCache.set(name, entry);
+    return entry;
+  } catch (e) {
+    return null;
+  }
+}
+
+function currentDroneName() {
+  const label = saSelect.options[saSelect.selectedIndex]?.text || "C";
+  return SHARP_TO_DRONE_NAME[label] || label;
+}
 
 let droneActive = false;
 let droneTimer = null;
-let droneStep = 0;
 let droneBus = null;
+let droneGate = null; // final gain before destination; snapped shut on stop
+let droneSample = null; // { buffer, bounds }
+let droneNodes = []; // {src, gain, endTime} currently scheduled/playing loop iterations
 
 // Separate volume + a synthetic hall reverb (no assets needed) so the drone
 // can sit further back than the melody instrument, on its own fader.
@@ -704,7 +752,16 @@ function ensureDroneBus() {
   comp.ratio.value = 4;
   comp.attack.value = 0.02;
   comp.release.value = 0.4;
-  droneOut.connect(comp).connect(ctx.destination);
+
+  // The reverb tail (4.5s) keeps sounding for a while after the dry signal
+  // is faded — on a sustained drone tone that tail reads almost identically
+  // to the note itself continuing. This gate sits after everything and gets
+  // snapped to 0 on stop so the tail is cut immediately too, not just the
+  // per-note gains that feed into it.
+  droneGate = ctx.createGain();
+  droneGate.gain.value = 1;
+  comp.connect(droneGate).connect(ctx.destination);
+  droneOut.connect(comp);
 
   droneBus.connect(droneOut);
 
@@ -730,47 +787,62 @@ function createReverbImpulse(ctx, duration, decay) {
   return buffer;
 }
 
-function scheduleDroneStep() {
-  if (!droneActive) return;
-  const saFreq = Number(saSelect.value);
-  const stepIdx = droneStep % DRONE_PATTERN.length;
-  const step = DRONE_PATTERN[stepIdx];
-  const freq = saFreq * step.ratio * OCTAVE_MULT[step.octave];
-  const startTime = audioCtx.currentTime + 0.05;
-  const isLast = stepIdx === DRONE_PATTERN.length - 1;
-  const stepDuration = isLast ? DRONE_INTERVAL_S * 2 : DRONE_INTERVAL_S;
+// Schedules one loop iteration starting at `startTime`, playing only the
+// trimmed (silence-free) span of the buffer, then schedules the next
+// iteration `loopDur - overlap` seconds later so consecutive copies overlap
+// by DRONE_LOOP_OVERLAP_S with a linear crossfade across that overlap — the
+// loop point is spliced rather than cut, so there's no click and no gap.
+function scheduleDroneIteration(startTime) {
+  if (!droneActive || !droneSample) return;
+  const ctx = audioCtx;
+  const { buffer, bounds } = droneSample;
+  const loopDur = bounds.end - bounds.start;
+  const overlap = Math.min(DRONE_LOOP_OVERLAP_S, loopDur / 2);
 
-  const stepDurationAt = (idx) =>
-    idx % DRONE_PATTERN.length === DRONE_PATTERN.length - 1 ? DRONE_INTERVAL_S * 2 : DRONE_INTERVAL_S;
-  const d1 = stepDurationAt(stepIdx + 1);
-  const d2 = stepDurationAt(stepIdx + 2);
-  const d3 = stepDurationAt(stepIdx + 3);
+  const src = ctx.createBufferSource();
+  src.buffer = buffer;
+  const gain = ctx.createGain();
+  src.connect(gain).connect(droneBus);
 
-  // Flat at 100% through its own beat, fading to 70% by the end of the next
-  // beat, then continuing down to 0% by the end of the beat after that —
-  // spreading the tail across three full beats so the overlap is unmistakable.
-  const envelope = [
-    [stepDuration, 1],
-    [stepDuration + d1, 0.7],
-    [stepDuration + d1 + d2 + d3, 0],
-  ];
+  gain.gain.setValueAtTime(0, startTime);
+  gain.gain.linearRampToValueAtTime(1, startTime + overlap);
+  gain.gain.setValueAtTime(1, startTime + loopDur - overlap);
+  gain.gain.linearRampToValueAtTime(0, startTime + loopDur);
 
-  if (sampleStore.has("tanpura")) {
-    playSampledNote("tanpura", freq, startTime, stepDuration, {
-      output: droneBus,
-      attack: DRONE_ATTACK_S,
-      envelope,
-      sustainOverride: true,
-    });
-  } else {
-    playFallbackSynth(freq, startTime, stepDuration, {
-      output: droneBus,
-      attack: DRONE_ATTACK_S,
-      envelope,
-    });
-  }
-  droneStep++;
-  droneTimer = setTimeout(scheduleDroneStep, stepDuration * 1000);
+  src.start(startTime, bounds.start, loopDur);
+  src.stop(startTime + loopDur + 0.02);
+
+  const endTime = startTime + loopDur + 0.02;
+  const node = { src, gain, endTime };
+  droneNodes.push(node);
+  const cleanupMs = Math.max(0, endTime + 0.05 - ctx.currentTime) * 1000;
+  setTimeout(() => {
+    try { src.disconnect(); gain.disconnect(); } catch (e) { /* already disconnected */ }
+    droneNodes = droneNodes.filter((n) => n !== node);
+  }, cleanupMs);
+
+  const nextStart = startTime + loopDur - overlap;
+  // Lookahead: schedule the next iteration's audio nodes ~0.5s before it's
+  // due, same pattern as the main note scheduler.
+  const delay = Math.max(0, nextStart - ctx.currentTime - 0.5) * 1000;
+  droneTimer = setTimeout(() => scheduleDroneIteration(nextStart), delay);
+}
+
+// Immediately silences any currently playing/scheduled loop iterations with
+// a short fade (rather than just cancelling the JS timer, which would leave
+// already-started AudioBufferSourceNodes ringing out for up to a full loop).
+function fadeOutActiveDroneNodes(fadeSec = 0.05) {
+  const ctx = audioCtx;
+  const now = ctx.currentTime;
+  droneNodes.forEach(({ src, gain }) => {
+    try {
+      gain.gain.cancelScheduledValues(now);
+      gain.gain.setValueAtTime(gain.gain.value, now);
+      gain.gain.linearRampToValueAtTime(0, now + fadeSec);
+      src.stop(now + fadeSec + 0.01);
+    } catch (e) { /* already stopped */ }
+  });
+  droneNodes = [];
 }
 
 async function startDrone() {
@@ -778,28 +850,56 @@ async function startDrone() {
   if (audioCtx.state === "suspended") audioCtx.resume();
   ensureDroneBus();
   droneBtn.disabled = true;
-  droneBtn.textContent = "Loading tanpura…";
-  await loadInstrumentSamples("tanpura");
+  droneBtn.textContent = "Loading drone…";
+  const name = currentDroneName();
+  droneSample = await loadDroneSample(name);
   droneBtn.disabled = false;
+  if (!droneSample) {
+    statusLine.textContent = `Couldn't load drone sample for ${name}.`;
+    droneBtn.textContent = "🎻 Tanpura Drone";
+    return;
+  }
   droneActive = true;
-  droneStep = 0;
   droneBtn.textContent = "⏹ Stop Drone";
   droneBtn.classList.add("active");
-  scheduleDroneStep();
+  const now = audioCtx.currentTime;
+  droneGate.gain.cancelScheduledValues(now);
+  droneGate.gain.setValueAtTime(1, now);
+  scheduleDroneIteration(now + 0.05);
 }
 
 function stopDrone() {
   droneActive = false;
   clearTimeout(droneTimer);
+  fadeOutActiveDroneNodes();
+  const now = audioCtx.currentTime;
+  droneGate.gain.cancelScheduledValues(now);
+  droneGate.gain.setValueAtTime(droneGate.gain.value, now);
+  droneGate.gain.linearRampToValueAtTime(0, now + 0.05);
   droneBtn.textContent = "🎻 Tanpura Drone";
   droneBtn.classList.remove("active");
+}
+
+// Re-pitches the running drone to the newly selected Sa without stopping it.
+async function retuneDrone() {
+  if (!droneActive) return;
+  const name = currentDroneName();
+  const sample = await loadDroneSample(name);
+  if (!sample) return;
+  clearTimeout(droneTimer);
+  fadeOutActiveDroneNodes();
+  droneSample = sample;
+  scheduleDroneIteration(audioCtx.currentTime + 0.06);
 }
 
 // ---------- Wire up ----------
 playBtn.addEventListener("click", startPlayback);
 stopBtn.addEventListener("click", stopPlayback);
 sargamInput.addEventListener("input", updatePreview);
-saSelect.addEventListener("change", updatePreview);
+saSelect.addEventListener("change", () => {
+  updatePreview();
+  retuneDrone();
+});
 instrumentSelect.addEventListener("change", () => switchInstrument(instrumentSelect.value));
 droneBtn.addEventListener("click", () => (droneActive ? stopDrone() : startDrone()));
 droneVolumeInput.addEventListener("input", () => {
