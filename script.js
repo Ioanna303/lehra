@@ -99,21 +99,94 @@ Object.entries(INSTRUMENTS).forEach(([key, cfg]) => {
 
 // ---------- Parser ----------
 // Token forms: "|" bar, "-" extend, "." rest, note like ",S" "S" "S'" "r" "G'" etc.
+// "[" ... "]" groups several sub-beats into a single beat's worth of time,
+// e.g. "[S R G M]" plays those four notes in the space of one beat.
 const NOTE_RE = /^(,)?([SRGMPDNsrgmpdn])(')?$/;
 
+// Brackets may be glued to an adjacent note ("[S", "M]") with no space, so
+// split them out into their own tokens before the main pass.
+function tokenizeSargam(text) {
+  const tokens = [];
+  for (const raw of text.trim().split(/\s+/).filter(Boolean)) {
+    let s = raw;
+    while (s.startsWith("[")) {
+      tokens.push("[");
+      s = s.slice(1);
+    }
+    const trailing = [];
+    while (s.endsWith("]") && s !== "]") {
+      trailing.unshift("]");
+      s = s.slice(0, -1);
+    }
+    if (s.length) tokens.push(s);
+    tokens.push(...trailing);
+  }
+  return tokens;
+}
+
+let groupIdCounter = 0;
+
 function parseSargam(text) {
-  const rawTokens = text.trim().split(/\s+/).filter(Boolean);
+  const rawTokens = tokenizeSargam(text);
   const events = []; // {type: 'note'|'rest', freqRatio, octave, letter, beats, dotPos}
   const displayTokens = []; // includes bar markers, for rendering
   const errors = [];
 
+  // When inside [...], notes/rests accumulate here instead of directly into
+  // events/displayTokens; on "]" their beats are rescaled to add up to 1.
+  let group = null; // { subEvents: [] }
+
+  function pushEvent(ev) {
+    if (group) {
+      group.subEvents.push(ev);
+    } else {
+      events.push(ev);
+      displayTokens.push(ev);
+    }
+  }
+
+  function closeGroup() {
+    const subEvents = group.subEvents;
+    group = null;
+    if (subEvents.length === 0) return;
+    const totalUnits = subEvents.reduce((sum, ev) => sum + ev.beats, 0);
+    const groupId = ++groupIdCounter;
+    subEvents.forEach((ev) => {
+      ev.beats = ev.beats / totalUnits;
+      ev.groupId = groupId;
+      events.push(ev);
+      displayTokens.push(ev);
+    });
+  }
+
   for (const tok of rawTokens) {
+    if (tok === "[") {
+      if (group) {
+        errors.push(`nested "[" is not supported`);
+        continue;
+      }
+      group = { subEvents: [] };
+      continue;
+    }
+    if (tok === "]") {
+      if (!group) {
+        errors.push(`"]" with no matching "["`);
+        continue;
+      }
+      closeGroup();
+      continue;
+    }
     if (tok === "|") {
+      if (group) {
+        errors.push(`"|" not allowed inside "[...]"`);
+        continue;
+      }
       displayTokens.push({ type: "bar" });
       continue;
     }
     if (tok === "-") {
-      const last = events[events.length - 1];
+      const pool = group ? group.subEvents : events;
+      const last = pool[pool.length - 1];
       if (last) {
         last.beats += 1;
       } else {
@@ -122,9 +195,7 @@ function parseSargam(text) {
       continue;
     }
     if (tok === "." || tok === "_") {
-      const ev = { type: "rest", beats: 1 };
-      events.push(ev);
-      displayTokens.push(ev);
+      pushEvent({ type: "rest", beats: 1 });
       continue;
     }
     const m = NOTE_RE.exec(tok);
@@ -146,15 +217,18 @@ function parseSargam(text) {
     if (mandraMark) octave = "mandra";
     else if (taarMark) octave = "taar";
 
-    const ev = {
+    pushEvent({
       type: "note",
       letter,
       octave,
       ratio,
       beats: 1,
-    };
-    events.push(ev);
-    displayTokens.push(ev);
+    });
+  }
+
+  if (group) {
+    errors.push(`unclosed "[" — treating remaining notes as one beat`);
+    closeGroup();
   }
 
   return { events, displayTokens, errors };
@@ -167,15 +241,35 @@ function freqFor(saFreq, ev) {
 // ---------- Rendering ----------
 function renderNotes(displayTokens, saFreq) {
   noteDisplay.innerHTML = "";
+  let currentGroupEl = null;
+  let currentGroupId = null;
   displayTokens.forEach((tok, i) => {
     if (tok.type === "bar") {
+      currentGroupEl = null;
+      currentGroupId = null;
       const sep = document.createElement("div");
       sep.className = "bar-sep";
       noteDisplay.appendChild(sep);
       return;
     }
+
+    let container = noteDisplay;
+    if (tok.groupId) {
+      if (tok.groupId !== currentGroupId) {
+        currentGroupEl = document.createElement("div");
+        currentGroupEl.className = "beat-group";
+        noteDisplay.appendChild(currentGroupEl);
+        currentGroupId = tok.groupId;
+      }
+      container = currentGroupEl;
+    } else {
+      currentGroupEl = null;
+      currentGroupId = null;
+    }
+
     const block = document.createElement("div");
     block.className = "note-block";
+    if (tok.groupId) block.classList.add("grouped");
     block.dataset.index = i;
     if (tok.type === "rest") {
       block.classList.add("rest");
@@ -200,7 +294,7 @@ function renderNotes(displayTokens, saFreq) {
         block.appendChild(dot);
       }
     }
-    noteDisplay.appendChild(block);
+    container.appendChild(block);
   });
 }
 
@@ -897,6 +991,7 @@ playBtn.addEventListener("click", startPlayback);
 stopBtn.addEventListener("click", stopPlayback);
 sargamInput.addEventListener("input", updatePreview);
 saSelect.addEventListener("change", () => {
+  currentSaFreq = Number(saSelect.value);
   updatePreview();
   retuneDrone();
 });

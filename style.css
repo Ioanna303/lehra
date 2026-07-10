@@ -198,6 +198,21 @@ textarea {
   transform: translateY(-3px);
   box-shadow: 0 3px 10px rgba(217, 142, 63, 0.5);
 }
+.beat-group {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  padding: 4px 5px 5px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+}
+.note-block.grouped {
+  min-width: 24px;
+  height: 36px;
+  font-size: 14px;
+  padding: 0 4px;
+}
 .bar-sep {
   width: 1px;
   align-self: stretch;
