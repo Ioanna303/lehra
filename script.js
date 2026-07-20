@@ -302,7 +302,19 @@ function renderNotes(displayTokens, saFreq) {
 let audioCtx = null;
 
 function ensureAudioCtx() {
-  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    // Android/Chrome can suspend the context mid-playback (audio-focus loss,
+    // output-device change, power management) even with the tab in the
+    // foreground and the screen on. Nothing else resumes it, which is why the
+    // melody dies after a while until Stop→Play is pressed. Auto-resume so it
+    // self-heals without user intervention.
+    audioCtx.onstatechange = () => {
+      if (audioCtx.state !== "running" && (isPlaying || droneActive)) {
+        audioCtx.resume().catch(() => {});
+      }
+    };
+  }
   return audioCtx;
 }
 
@@ -564,6 +576,10 @@ function buildEventDisplayIndex() {
 
 function scheduler() {
   const ctx = audioCtx;
+  // If the context was suspended and has just resumed, its clock jumped
+  // forward while nextNoteTime stood still. Re-anchor rather than dump the
+  // whole backlog of now-overdue notes at once.
+  if (nextNoteTime < ctx.currentTime) nextNoteTime = ctx.currentTime + 0.1;
   while (nextNoteTime < ctx.currentTime + SCHEDULE_AHEAD_S) {
     if (nextEventPos >= events.length) {
       if (loopToggle.checked && events.length > 0) {
