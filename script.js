@@ -600,39 +600,57 @@ function buildEventDisplayIndex() {
   });
 }
 
+// The scheduler is self-healing: relying on the AudioContext's statechange
+// event alone wasn't enough on Android, where the context can stall (or a
+// buffer-source call can throw) without ever emitting a clean "suspended"
+// event, leaving nothing to recover it. So every tick we (a) resume the
+// context if it isn't running, and (b) run inside try/catch and always
+// reschedule while playing, so a transient error can never kill the loop.
+let clockStalls = 0;
+
 function scheduler() {
   const ctx = audioCtx;
-  // If the context was suspended and has just resumed, its clock jumped
-  // forward while nextNoteTime stood still. Re-anchor rather than dump the
-  // whole backlog of now-overdue notes at once.
-  if (nextNoteTime < ctx.currentTime) nextNoteTime = ctx.currentTime + 0.1;
-  while (nextNoteTime < ctx.currentTime + SCHEDULE_AHEAD_S) {
-    if (nextEventPos >= events.length) {
-      if (loopToggle.checked && events.length > 0) {
-        nextEventPos = 0;
-      } else {
-        stopPlayback();
-        return;
+  try {
+    if (ctx.state !== "running") {
+      clockStalls++;
+      console.warn(`[lehra] AudioContext not running (state=${ctx.state}); resuming (#${clockStalls})`);
+      ctx.resume().catch(() => {});
+    }
+    // If the context was suspended/stalled and just resumed, its clock jumped
+    // forward while nextNoteTime stood still. Re-anchor rather than dump the
+    // whole backlog of now-overdue notes at once.
+    if (nextNoteTime < ctx.currentTime) nextNoteTime = ctx.currentTime + 0.1;
+    while (nextNoteTime < ctx.currentTime + SCHEDULE_AHEAD_S) {
+      if (nextEventPos >= events.length) {
+        if (loopToggle.checked && events.length > 0) {
+          nextEventPos = 0;
+        } else {
+          stopPlayback();
+          break;
+        }
       }
-    }
-    const ev = events[nextEventPos];
-    const beatDur = 60 / Number(tempoInput.value);
-    const duration = ev.beats * beatDur;
+      const ev = events[nextEventPos];
+      const beatDur = 60 / Number(tempoInput.value);
+      const duration = ev.beats * beatDur;
 
-    if (ev.type === "note") {
-      const freq = freqFor(currentSaFreq, ev);
-      playNote(freq, nextNoteTime, duration);
-    }
-    highlightQueue.push({
-      domIndex: eventDisplayIndex[nextEventPos],
-      time: nextNoteTime,
-      endTime: nextNoteTime + duration,
-    });
+      if (ev.type === "note") {
+        const freq = freqFor(currentSaFreq, ev);
+        playNote(freq, nextNoteTime, duration);
+      }
+      highlightQueue.push({
+        domIndex: eventDisplayIndex[nextEventPos],
+        time: nextNoteTime,
+        endTime: nextNoteTime + duration,
+      });
 
-    nextNoteTime += duration;
-    nextEventPos++;
+      nextNoteTime += duration;
+      nextEventPos++;
+    }
+  } catch (e) {
+    console.error("[lehra] scheduler error (continuing)", e);
   }
-  schedulerTimer = setTimeout(scheduler, LOOKAHEAD_MS);
+  // Keep the loop alive as long as we're playing, no matter what happened above.
+  if (isPlaying) schedulerTimer = setTimeout(scheduler, LOOKAHEAD_MS);
 }
 
 function highlightLoop() {
