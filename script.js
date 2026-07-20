@@ -318,6 +318,32 @@ function ensureAudioCtx() {
   return audioCtx;
 }
 
+// ---------- Screen Wake Lock ----------
+// On iOS every browser (incl. Chrome/Brave) runs on WebKit, which silences a
+// Web Audio context the moment the screen locks. Holding a screen wake lock
+// while a melody or drone plays keeps the screen from auto-locking, so the
+// audio isn't interrupted mid-session. (A manual power-button lock still
+// stops it — that's an unavoidable iOS restriction.)
+let wakeLock = null;
+
+async function requestWakeLock() {
+  if (wakeLock || !navigator.wakeLock) return;
+  try {
+    wakeLock = await navigator.wakeLock.request("screen");
+    // The OS drops the lock whenever the page is hidden; clear our handle so
+    // it can be re-acquired on return (see the visibilitychange handler).
+    wakeLock.addEventListener("release", () => { wakeLock = null; });
+  } catch (e) {
+    // Unsupported or denied (e.g. low-power mode) — nothing else to do.
+  }
+}
+
+function releaseWakeLockIfIdle() {
+  if (isPlaying || droneActive) return;
+  wakeLock?.release?.().catch(() => {});
+  wakeLock = null;
+}
+
 // ---------- Sample playback (recorded instrument notes) ----------
 const sampleStore = new Map(); // inst -> [{freq, buffer}], sorted by freq
 const loadedInstruments = new Set();
@@ -574,39 +600,57 @@ function buildEventDisplayIndex() {
   });
 }
 
+// The scheduler is self-healing: relying on the AudioContext's statechange
+// event alone wasn't enough on Android, where the context can stall (or a
+// buffer-source call can throw) without ever emitting a clean "suspended"
+// event, leaving nothing to recover it. So every tick we (a) resume the
+// context if it isn't running, and (b) run inside try/catch and always
+// reschedule while playing, so a transient error can never kill the loop.
+let clockStalls = 0;
+
 function scheduler() {
   const ctx = audioCtx;
-  // If the context was suspended and has just resumed, its clock jumped
-  // forward while nextNoteTime stood still. Re-anchor rather than dump the
-  // whole backlog of now-overdue notes at once.
-  if (nextNoteTime < ctx.currentTime) nextNoteTime = ctx.currentTime + 0.1;
-  while (nextNoteTime < ctx.currentTime + SCHEDULE_AHEAD_S) {
-    if (nextEventPos >= events.length) {
-      if (loopToggle.checked && events.length > 0) {
-        nextEventPos = 0;
-      } else {
-        stopPlayback();
-        return;
+  try {
+    if (ctx.state !== "running") {
+      clockStalls++;
+      console.warn(`[lehra] AudioContext not running (state=${ctx.state}); resuming (#${clockStalls})`);
+      ctx.resume().catch(() => {});
+    }
+    // If the context was suspended/stalled and just resumed, its clock jumped
+    // forward while nextNoteTime stood still. Re-anchor rather than dump the
+    // whole backlog of now-overdue notes at once.
+    if (nextNoteTime < ctx.currentTime) nextNoteTime = ctx.currentTime + 0.1;
+    while (nextNoteTime < ctx.currentTime + SCHEDULE_AHEAD_S) {
+      if (nextEventPos >= events.length) {
+        if (loopToggle.checked && events.length > 0) {
+          nextEventPos = 0;
+        } else {
+          stopPlayback();
+          break;
+        }
       }
-    }
-    const ev = events[nextEventPos];
-    const beatDur = 60 / Number(tempoInput.value);
-    const duration = ev.beats * beatDur;
+      const ev = events[nextEventPos];
+      const beatDur = 60 / Number(tempoInput.value);
+      const duration = ev.beats * beatDur;
 
-    if (ev.type === "note") {
-      const freq = freqFor(currentSaFreq, ev);
-      playNote(freq, nextNoteTime, duration);
-    }
-    highlightQueue.push({
-      domIndex: eventDisplayIndex[nextEventPos],
-      time: nextNoteTime,
-      endTime: nextNoteTime + duration,
-    });
+      if (ev.type === "note") {
+        const freq = freqFor(currentSaFreq, ev);
+        playNote(freq, nextNoteTime, duration);
+      }
+      highlightQueue.push({
+        domIndex: eventDisplayIndex[nextEventPos],
+        time: nextNoteTime,
+        endTime: nextNoteTime + duration,
+      });
 
-    nextNoteTime += duration;
-    nextEventPos++;
+      nextNoteTime += duration;
+      nextEventPos++;
+    }
+  } catch (e) {
+    console.error("[lehra] scheduler error (continuing)", e);
   }
-  schedulerTimer = setTimeout(scheduler, LOOKAHEAD_MS);
+  // Keep the loop alive as long as we're playing, no matter what happened above.
+  if (isPlaying) schedulerTimer = setTimeout(scheduler, LOOKAHEAD_MS);
 }
 
 function highlightLoop() {
@@ -658,6 +702,7 @@ function startPlayback() {
   playBtn.disabled = true;
   stopBtn.disabled = false;
   sargamInput.disabled = true;
+  requestWakeLock();
 
   scheduler();
   rafHandle = requestAnimationFrame(highlightLoop);
@@ -672,6 +717,7 @@ function stopPlayback() {
   stopBtn.disabled = true;
   sargamInput.disabled = false;
   if (statusLine.textContent === "Playing…") statusLine.textContent = "Stopped.";
+  releaseWakeLockIfIdle();
 }
 
 // ---------- Live preview render (before playing) ----------
@@ -972,6 +1018,7 @@ async function startDrone() {
   droneActive = true;
   droneBtn.textContent = "⏹ Stop Drone";
   droneBtn.classList.add("active");
+  requestWakeLock();
   const now = audioCtx.currentTime;
   droneGate.gain.cancelScheduledValues(now);
   droneGate.gain.setValueAtTime(1, now);
@@ -988,6 +1035,7 @@ function stopDrone() {
   droneGate.gain.linearRampToValueAtTime(0, now + 0.05);
   droneBtn.textContent = "🎻 Tanpura Drone";
   droneBtn.classList.remove("active");
+  releaseWakeLockIfIdle();
 }
 
 // Re-pitches the running drone to the newly selected Sa without stopping it.
@@ -1021,6 +1069,17 @@ deleteLehraBtn.addEventListener("click", deleteLehra);
 savedSelect.addEventListener("change", () => {
   deleteLehraBtn.disabled = !savedSelect.value;
   if (savedSelect.value) loadLehra(savedSelect.value);
+});
+
+// Coming back to a hidden/backgrounded tab: the OS has dropped the wake lock
+// and may have suspended the audio context. Re-acquire and resume so playback
+// continues without needing Stop→Play.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  if (isPlaying || droneActive) {
+    requestWakeLock();
+    if (audioCtx && audioCtx.state !== "running") audioCtx.resume().catch(() => {});
+  }
 });
 
 updatePreview();
